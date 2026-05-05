@@ -9,10 +9,11 @@
   <body>
     <div id="app">
       <video id="webcam" playsinline muted></video>
+      <video id="webcam-preview" playsinline muted aria-hidden="true"></video>
       <canvas id="canvas"></canvas>
       <p class="hint">
-        Tap a dot to open its orb; tap the center again to shrink. Allow camera access — point your right index
-        finger at a particle to see it glow (pinch-to-bloom comes next).
+        Tap a dot to open its orb, or use hands: right index selects (glow), left hand spread/pinch drives bloom. Ease
+        the pinch partway closed (not necessarily all the way) to finish and pick another node.
       </p>
     </div>
     <script type="module" src="/src/main.js"></script>

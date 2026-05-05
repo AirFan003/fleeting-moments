@@ -40,6 +40,25 @@ body {
   z-index: 0;
 }
 
+/** Mirrored PiP of the same stream as `#webcam` — hand tracking still uses the full-viewport hidden feed. */
+#webcam-preview {
+  position: fixed;
+  top: max(0.75rem, env(safe-area-inset-top));
+  left: max(0.75rem, env(safe-area-inset-left));
+  width: min(240px, 32vw);
+  max-height: 22vh;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  transform: scaleX(-1);
+  border-radius: 10px;
+  border: 1px solid rgba(230, 220, 255, 0.16);
+  box-shadow:
+    0 4px 24px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  z-index: 2;
+  pointer-events: none;
+}
+
 #canvas {
   position: relative;
   z-index: 1;

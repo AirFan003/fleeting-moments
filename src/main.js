@@ -14,13 +14,19 @@ const PINCH_OPEN = 0.19;
 const HAND_BLOOM_OPEN_THRESH = 0.07;
 
 /**
+ * Pinch below this (with animT mostly there) ends the hand session — loose "close enough"
+ * without pinching all the way shut.
+ */
+const HAND_PINCH_END_SESSION = 0.14;
+
+/**
  * Visual sizing aimed at later hand-tracking "catch" + photo expansion:
  * slightly smaller sprites than overlap-heavy layouts — pair with seeded grid gaps.
  */
 const PARTICLE_HAND_TARGET = {
-  pointScale: 950,
-  minDiameterPx: 36,
-  maxDiameterPx: 380,
+  pointScale: 1120,
+  minDiameterPx: 52,
+  maxDiameterPx: 480,
 };
 
 /** Radial branches per orb — up to ~10 photo thumbnails per node later. */
@@ -293,6 +299,11 @@ if (!webcam) {
   throw new Error('Missing #webcam element.');
 }
 
+const webcamPreview = document.getElementById('webcam-preview');
+if (!webcamPreview) {
+  throw new Error('Missing #webcam-preview element.');
+}
+
 const scene = new THREE.Scene();
 
 const camera = new THREE.PerspectiveCamera(58, 1, 0.1, 220);
@@ -452,8 +463,10 @@ const orbState = {
   closing: false,
   particleIndex: -1,
   animT: 0,
-  /** When true, opening was triggered by hand; left hand leaving frame will retract the bloom. */
+  /** True when the orb was opened via right-hand target + left pinch (not tap). */
   openedViaHand: false,
+  /** Last mapped pinch openness when left hand was seen; used to hold bloom if left hand briefly leaves. */
+  lastPinchBloomTarget: 0,
 };
 
 const projScratch = new THREE.Vector3();
@@ -524,6 +537,7 @@ function finishCloseOrb() {
   orbState.particleIndex = -1;
   orbState.animT = 0;
   orbState.openedViaHand = false;
+  orbState.lastPinchBloomTarget = 0;
   orbGroup.visible = false;
 }
 
@@ -531,7 +545,7 @@ function closeOrb() {
   finishCloseOrb();
 }
 
-function openOrb(particleIndex, { viaHand = false } = {}) {
+function openOrb(particleIndex, { viaHand = false, initialAnimT = 0 } = {}) {
   orbState.closing = false;
   restoreOrbParticle();
   orbState.openedViaHand = viaHand;
@@ -568,7 +582,7 @@ function openOrb(particleIndex, { viaHand = false } = {}) {
 
   orbState.active = true;
   orbState.particleIndex = particleIndex;
-  orbState.animT = 0;
+  orbState.animT = THREE.MathUtils.clamp(initialAnimT, 0, 1);
   orbGroup.visible = true;
 }
 
@@ -593,8 +607,14 @@ canvas.addEventListener(
 
     const picked = pickParticle(e.clientX, e.clientY);
     if (picked >= 0) {
+      if (orbState.active && orbState.openedViaHand && picked !== orbState.particleIndex) {
+        return;
+      }
       openOrb(picked);
     } else {
+      if (orbState.active && orbState.openedViaHand) {
+        return;
+      }
       closeOrb();
     }
   },
@@ -604,18 +624,17 @@ canvas.addEventListener(
 function updateOrb(arr, dt, tShader, handBloomDrive) {
   if (!orbState.active) return;
 
-  if (handBloomDrive != null) {
-    orbState.closing = false;
-    const target = THREE.MathUtils.clamp(handBloomDrive.target, 0, 1);
-    orbState.animT = THREE.MathUtils.damp(orbState.animT, target, 14.5, dt);
-    if (target < 0.028 && orbState.animT < 0.035) {
+  if (orbState.closing) {
+    orbState.animT = Math.max(0, orbState.animT - dt / ORB_EXPAND_DURATION);
+    if (orbState.animT <= 0) {
       orbState.animT = 0;
       finishCloseOrb();
       return;
     }
-  } else if (orbState.closing) {
-    orbState.animT = Math.max(0, orbState.animT - dt / ORB_EXPAND_DURATION);
-    if (orbState.animT <= 0) {
+  } else if (handBloomDrive != null) {
+    const target = THREE.MathUtils.clamp(handBloomDrive.target, 0, 1);
+    orbState.animT = THREE.MathUtils.damp(orbState.animT, target, 14.5, dt);
+    if (target < HAND_PINCH_END_SESSION && orbState.animT < HAND_PINCH_END_SESSION + 0.08) {
       orbState.animT = 0;
       finishCloseOrb();
       return;
@@ -796,20 +815,21 @@ function pinchToOpen01(span) {
   return u * u;
 }
 
-async function startWebcam(video) {
+async function startWebcam(video, previewVideo) {
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
     audio: false,
   });
   video.srcObject = stream;
-  await video.play();
+  previewVideo.srcObject = stream;
+  await Promise.all([video.play(), previewVideo.play()]);
 }
 
 async function initHandTracking() {
   if (!navigator.mediaDevices?.getUserMedia) return;
 
   try {
-    await startWebcam(webcam);
+    await startWebcam(webcam, webcamPreview);
   } catch (e) {
     console.warn('[hands] Webcam unavailable:', e);
     return;
@@ -910,14 +930,42 @@ function runHandLandmarker(dt) {
   }
 }
 
-/** Step 1: hand controls hover highlight only; pinch bloom re-enabled later. */
+/** Left pinch→bloom; `openedViaHand` locks until you ease the pinch closed enough (see HAND_PINCH_END_SESSION). */
 function buildHandBloomDrive() {
+  const pinch = handPipe.smoothedPinch;
+
+  if (!orbState.active) {
+    if (!handPipe.leftPresent || pinch < HAND_BLOOM_OPEN_THRESH) return null;
+    if (!handPipe.rightPresent || handPipe.effectivePick < 0) return null;
+    openOrb(handPipe.effectivePick, { viaHand: true, initialAnimT: pinch });
+    orbState.lastPinchBloomTarget = pinch;
+    return { target: pinch };
+  }
+
+  if (orbState.openedViaHand) {
+    if (handPipe.leftPresent) {
+      orbState.lastPinchBloomTarget = pinch;
+      return { target: pinch };
+    }
+    return { target: orbState.lastPinchBloomTarget };
+  }
+
+  if (handPipe.leftPresent) {
+    orbState.lastPinchBloomTarget = pinch;
+    return { target: pinch };
+  }
+
   return null;
 }
 
 function updateFingerHoverHighlights(dt) {
   const hi = geometry.attributes.highlight.array;
-  const targetIdx = handPipe.rightPresent ? handPipe.effectivePick : -1;
+  let targetIdx = -1;
+  if (orbState.active && orbState.openedViaHand) {
+    targetIdx = orbState.particleIndex;
+  } else if (handPipe.rightPresent) {
+    targetIdx = handPipe.effectivePick;
+  }
   const λ = 20;
   for (let i = 0; i < COUNT; i++) {
     const t = targetIdx >= 0 && i === targetIdx ? 1 : 0;
