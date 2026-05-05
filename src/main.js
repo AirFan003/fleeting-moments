@@ -10,9 +10,13 @@ const PARTICLE_HAND_TARGET = {
   maxDiameterPx: 380,
 };
 
+/** Radial branches per orb — up to ~10 photo thumbnails per node later. */
+const ORB_BRANCH_COUNT = 10;
+
 const VERTEX = /* glsl */ `
   attribute vec3 color;
   attribute float phase;
+  attribute float visibility;
   uniform float time;
   uniform float uPixelRatio;
   uniform float uPointScale;
@@ -20,8 +24,10 @@ const VERTEX = /* glsl */ `
   uniform float uPointPxMax;
   varying vec3 vColor;
   varying float vTwinkle;
+  varying float vVis;
 
   void main() {
+    vVis = visibility;
     vColor = color;
     vTwinkle = 0.72 + 0.28 * sin(time * 0.55 + phase * 6.2831853);
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
@@ -34,15 +40,69 @@ const VERTEX = /* glsl */ `
 const FRAGMENT = /* glsl */ `
   varying vec3 vColor;
   varying float vTwinkle;
+  varying float vVis;
 
   void main() {
+    if (vVis < 0.001) discard;
     vec2 c = gl_PointCoord - vec2(0.5);
     float len = length(c);
     if (len > 0.5) discard;
     float core = 1.0 - smoothstep(0.0, 0.38, len);
     float glow = exp(-len * 8.5) * 0.22;
-    float alpha = (core * 0.88 + glow * 0.38) * vTwinkle * 0.78;
+    float alpha = (core * 0.88 + glow * 0.38) * vTwinkle * 0.78 * vVis;
     gl_FragColor = vec4(vColor * (core + glow * 0.42), alpha);
+  }
+`;
+
+const ORB_CENTER_VERT = /* glsl */ `
+  attribute vec3 color;
+  attribute float phase;
+  attribute float visibility;
+  uniform float time;
+  uniform float uPixelRatio;
+  uniform float uPointScale;
+  uniform float uPointPxMin;
+  uniform float uPointPxMax;
+  varying vec3 vColor;
+  varying float vTwinkle;
+  varying float vVis;
+
+  void main() {
+    vVis = visibility;
+    vColor = color;
+    vTwinkle = 0.72 + 0.28 * sin(time * 0.55 + phase * 6.2831853);
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    float depthScale = uPointScale / max(-mvPosition.z, 1.0);
+    gl_PointSize = clamp(depthScale * uPixelRatio, uPointPxMin, uPointPxMax);
+    gl_Position = projectionMatrix * mvPosition;
+  }
+`;
+
+const ORB_TIP_VERT = /* glsl */ `
+  attribute vec3 color;
+  uniform float uPixelRatio;
+  uniform float uPointScale;
+  uniform float uPointPxMin;
+  uniform float uPointPxMax;
+  varying vec3 vColor;
+
+  void main() {
+    vColor = color;
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    float depthScale = uPointScale / max(-mvPosition.z, 1.0);
+    gl_PointSize = clamp(depthScale * uPixelRatio, uPointPxMin, uPointPxMax);
+    gl_Position = projectionMatrix * mvPosition;
+  }
+`;
+
+const ORB_TIP_FRAG = /* glsl */ `
+  varying vec3 vColor;
+
+  void main() {
+    vec2 c = gl_PointCoord - vec2(0.5);
+    float r = length(c);
+    if (r > 0.49 || r < 0.32) discard;
+    gl_FragColor = vec4(vColor, 0.94);
   }
 `;
 
@@ -52,6 +112,12 @@ function prefersReducedMotion() {
 
 function modSafe(a, n) {
   return ((a % n) + n) % n;
+}
+
+/** Soft accel/decel — reads less 'pop' than cubic for organic growth. */
+function easeInOutSine(t) {
+  const x = THREE.MathUtils.clamp(t, 0, 1);
+  return 0.5 - 0.5 * Math.cos(Math.PI * x);
 }
 
 function hexToRgb01(hex) {
@@ -169,6 +235,24 @@ function syncCameraAspect(cam) {
   cam.updateProjectionMatrix();
 }
 
+function fillFibonacciDirections(outDirs, n, jitterStrength, scratch, randFn) {
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < n; i++) {
+    const y = n > 1 ? 1 - (i / (n - 1)) * 2 : 0;
+    const r = Math.sqrt(Math.max(0, 1 - y * y));
+    const theta = golden * i;
+    scratch.set(Math.cos(theta) * r, y, Math.sin(theta) * r);
+    scratch.x += (randFn() - 0.5) * jitterStrength;
+    scratch.y += (randFn() - 0.5) * jitterStrength;
+    scratch.z += (randFn() - 0.5) * jitterStrength;
+    scratch.normalize();
+    const i3 = i * 3;
+    outDirs[i3] = scratch.x;
+    outDirs[i3 + 1] = scratch.y;
+    outDirs[i3 + 2] = scratch.z;
+  }
+}
+
 const reducedMotion = prefersReducedMotion();
 
 const canvas = document.getElementById('canvas');
@@ -209,11 +293,16 @@ for (let i = 0; i < COUNT; i++) {
 }
 
 const particleCategories = assignParticleCategories(COUNT);
+const particleColors = colorsFromCategories(particleCategories);
+
+const visibilityAttr = new Float32Array(COUNT);
+visibilityAttr.fill(1);
 
 const geometry = new THREE.BufferGeometry();
 geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-geometry.setAttribute('color', new THREE.BufferAttribute(colorsFromCategories(particleCategories), 3));
+geometry.setAttribute('color', new THREE.BufferAttribute(particleColors, 3));
 geometry.setAttribute('phase', new THREE.BufferAttribute(phases, 1));
+geometry.setAttribute('visibility', new THREE.BufferAttribute(visibilityAttr, 1));
 geometry.computeBoundingSphere();
 
 const material = new THREE.ShaderMaterial({
@@ -237,6 +326,266 @@ points.frustumCulled = false;
 points.renderOrder = 999;
 scene.add(points);
 
+/* ---------- Tap → radial orb (lines + hollow tip nodes; ready for image quads later) ---------- */
+
+const orbGroup = new THREE.Group();
+orbGroup.visible = false;
+orbGroup.renderOrder = 1002;
+scene.add(orbGroup);
+
+const orbDirs = new Float32Array(ORB_BRANCH_COUNT * 3);
+const orbLenJit = new Float32Array(ORB_BRANCH_COUNT);
+const orbBranchStagger = new Float32Array(ORB_BRANCH_COUNT);
+const dirScratch = new THREE.Vector3();
+const bendAxisScratch = new THREE.Vector3();
+const worldUp = new THREE.Vector3(0, 1, 0);
+
+const linePositions = new Float32Array(ORB_BRANCH_COUNT * 2 * 3);
+const lineGeom = new THREE.BufferGeometry();
+lineGeom.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
+const lineMat = new THREE.LineBasicMaterial({
+  transparent: true,
+  opacity: 0.76,
+  depthWrite: false,
+  depthTest: false,
+});
+const orbLines = new THREE.LineSegments(lineGeom, lineMat);
+orbLines.frustumCulled = false;
+orbGroup.add(orbLines);
+
+const tipPositions = new Float32Array(ORB_BRANCH_COUNT * 3);
+const tipColors = new Float32Array(ORB_BRANCH_COUNT * 3);
+const tipGeom = new THREE.BufferGeometry();
+tipGeom.setAttribute('position', new THREE.BufferAttribute(tipPositions, 3));
+tipGeom.setAttribute('color', new THREE.BufferAttribute(tipColors, 3));
+
+const tipMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uPixelRatio: { value: renderer.getPixelRatio() },
+    uPointScale: { value: PARTICLE_HAND_TARGET.pointScale * 0.38 },
+    uPointPxMin: { value: 10 },
+    uPointPxMax: { value: 96 },
+  },
+  vertexShader: ORB_TIP_VERT,
+  fragmentShader: ORB_TIP_FRAG,
+  transparent: true,
+  depthWrite: false,
+  depthTest: false,
+  blending: THREE.NormalBlending,
+});
+const orbTips = new THREE.Points(tipGeom, tipMat);
+orbTips.frustumCulled = false;
+orbGroup.add(orbTips);
+
+const centerPos = new Float32Array(3);
+const centerGeom = new THREE.BufferGeometry();
+centerGeom.setAttribute('position', new THREE.BufferAttribute(centerPos, 3));
+const centerColorArr = new Float32Array(3);
+centerGeom.setAttribute('color', new THREE.BufferAttribute(centerColorArr, 3));
+centerGeom.setAttribute('phase', new THREE.BufferAttribute(new Float32Array([0.35]), 1));
+centerGeom.setAttribute('visibility', new THREE.BufferAttribute(new Float32Array([1]), 1));
+
+const orbCenterMat = new THREE.ShaderMaterial({
+  uniforms: {
+    time: { value: 0 },
+    uPixelRatio: { value: renderer.getPixelRatio() },
+    uPointScale: { value: PARTICLE_HAND_TARGET.pointScale },
+    uPointPxMin: { value: PARTICLE_HAND_TARGET.minDiameterPx },
+    uPointPxMax: { value: PARTICLE_HAND_TARGET.maxDiameterPx },
+  },
+  vertexShader: ORB_CENTER_VERT,
+  fragmentShader: FRAGMENT,
+  transparent: true,
+  depthWrite: false,
+  depthTest: false,
+  blending: THREE.NormalBlending,
+});
+const orbCenter = new THREE.Points(centerGeom, orbCenterMat);
+orbCenter.frustumCulled = false;
+orbGroup.add(orbCenter);
+
+const ORB_EXPAND_DURATION = reducedMotion ? 1.05 : 2.25;
+const ORB_BASE_BRANCH_LEN = 5.65;
+
+const orbState = {
+  active: false,
+  particleIndex: -1,
+  animT: 0,
+};
+
+const projScratch = new THREE.Vector3();
+
+function pickParticle(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const arr = geometry.attributes.position.array;
+  const vis = geometry.attributes.visibility.array;
+  const pxTol = PARTICLE_HAND_TARGET.maxDiameterPx * 0.58;
+  let best = -1;
+  let bestD = Infinity;
+
+  for (let i = 0; i < COUNT; i++) {
+    if (vis[i] < 0.05) continue;
+    const i3 = i * 3;
+    projScratch.set(arr[i3], arr[i3 + 1], arr[i3 + 2]);
+    projScratch.project(camera);
+    if (projScratch.z <= -1 || projScratch.z >= 1) continue;
+    const sx = (projScratch.x * 0.5 + 0.5) * rect.width;
+    const sy = (-projScratch.y * 0.5 + 0.5) * rect.height;
+    const dx = clientX - rect.left - sx;
+    const dy = clientY - rect.top - sy;
+    const d = Math.hypot(dx, dy);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+
+  if (best < 0 || bestD > pxTol) return -1;
+  return best;
+}
+
+function restoreOrbParticle() {
+  if (orbState.active && orbState.particleIndex >= 0) {
+    visibilityAttr[orbState.particleIndex] = 1;
+    geometry.attributes.visibility.needsUpdate = true;
+  }
+}
+
+function closeOrb() {
+  restoreOrbParticle();
+  orbState.active = false;
+  orbState.particleIndex = -1;
+  orbState.animT = 0;
+  orbGroup.visible = false;
+}
+
+function openOrb(particleIndex) {
+  restoreOrbParticle();
+
+  visibilityAttr[particleIndex] = 0;
+  geometry.attributes.visibility.needsUpdate = true;
+
+  fillFibonacciDirections(orbDirs, ORB_BRANCH_COUNT, 0.14, dirScratch, Math.random);
+  for (let i = 0; i < ORB_BRANCH_COUNT; i++) {
+    orbLenJit[i] = 0.88 + Math.random() * 0.2;
+    const u = Math.random();
+    orbBranchStagger[i] = u ** 1.45 * 0.72;
+  }
+
+  const ci = particleIndex * 3;
+  const r = particleColors[ci];
+  const g = particleColors[ci + 1];
+  const b = particleColors[ci + 2];
+  lineMat.color.setRGB(r, g, b);
+  lineMat.needsUpdate = true;
+
+  for (let i = 0; i < ORB_BRANCH_COUNT; i++) {
+    const i3 = i * 3;
+    tipColors[i3] = r;
+    tipColors[i3 + 1] = g;
+    tipColors[i3 + 2] = b;
+  }
+  tipGeom.attributes.color.needsUpdate = true;
+
+  centerColorArr[0] = r;
+  centerColorArr[1] = g;
+  centerColorArr[2] = b;
+  centerGeom.attributes.color.needsUpdate = true;
+
+  orbState.active = true;
+  orbState.particleIndex = particleIndex;
+  orbState.animT = 0;
+  orbGroup.visible = true;
+}
+
+canvas.addEventListener(
+  'pointerdown',
+  (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    const picked = pickParticle(e.clientX, e.clientY);
+    if (picked >= 0) {
+      openOrb(picked);
+    } else {
+      closeOrb();
+    }
+  },
+  { passive: true },
+);
+
+function updateOrb(arr, dt, tShader) {
+  if (!orbState.active) return;
+
+  orbState.animT = Math.min(1, orbState.animT + dt / ORB_EXPAND_DURATION);
+  const gt = orbState.animT;
+
+  const centerPulse = THREE.MathUtils.lerp(
+    1.06,
+    1.34,
+    easeInOutSine(Math.min(1, gt * 0.88)),
+  );
+
+  const ci = orbState.particleIndex * 3;
+  const cx = arr[ci];
+  const cy = arr[ci + 1];
+  const cz = arr[ci + 2];
+
+  centerPos[0] = cx;
+  centerPos[1] = cy;
+  centerPos[2] = cz;
+  centerGeom.attributes.position.needsUpdate = true;
+
+  orbCenterMat.uniforms.time.value = tShader;
+  orbCenterMat.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+  orbCenterMat.uniforms.uPointScale.value = PARTICLE_HAND_TARGET.pointScale * centerPulse;
+
+  tipMat.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+
+  const lp = linePositions;
+  const tp = tipPositions;
+
+  for (let i = 0; i < ORB_BRANCH_COUNT; i++) {
+    const i3 = i * 3;
+    const i6 = i * 6;
+    const dx = orbDirs[i3];
+    const dy = orbDirs[i3 + 1];
+    const dz = orbDirs[i3 + 2];
+
+    const start = orbBranchStagger[i];
+    const denom = Math.max(1e-5, 1 - start);
+    const branchLinear = gt <= start ? 0 : (gt - start) / denom;
+    const branchE = easeInOutSine(THREE.MathUtils.clamp(branchLinear, 0, 1));
+
+    const L = ORB_BASE_BRANCH_LEN * orbLenJit[i] * branchE;
+
+    bendAxisScratch.set(dx, dy, dz).cross(worldUp);
+    if (bendAxisScratch.lengthSq() < 1e-8) {
+      bendAxisScratch.set(1, 0, 0);
+    }
+    bendAxisScratch.normalize();
+    const sag = easeInOutSine(branchE) * 0.19;
+
+    const ox = dx * L + bendAxisScratch.x * sag;
+    const oy = dy * L + bendAxisScratch.y * sag;
+    const oz = dz * L + bendAxisScratch.z * sag;
+
+    lp[i6] = cx;
+    lp[i6 + 1] = cy;
+    lp[i6 + 2] = cz;
+    lp[i6 + 3] = cx + ox;
+    lp[i6 + 4] = cy + oy;
+    lp[i6 + 5] = cz + oz;
+
+    tp[i3] = lp[i6 + 3];
+    tp[i3 + 1] = lp[i6 + 4];
+    tp[i3 + 2] = lp[i6 + 5];
+  }
+
+  lineGeom.attributes.position.needsUpdate = true;
+  tipGeom.attributes.position.needsUpdate = true;
+}
+
+/* ---------- Main loop ---------- */
+
 const clock = new THREE.Clock();
 
 const mouse = { x: 0, y: 0, tx: 0, ty: 0 };
@@ -253,15 +602,20 @@ function resize() {
   camera.updateProjectionMatrix();
   renderer.setSize(w, h);
   material.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+  orbCenterMat.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+  tipMat.uniforms.uPixelRatio.value = renderer.getPixelRatio();
   seedParticlesHorizontal(basePositions, camera, COUNT);
 }
 window.addEventListener('resize', resize);
 resize();
 
+clock.getDelta();
+
 const motionScale = reducedMotion ? 0.35 : 1;
-const fallSpeed = reducedMotion ? 1.2 : 2.35;
+const fallSpeed = reducedMotion ? 0.78 : 1.48;
 
 function tick() {
+  const dt = THREE.MathUtils.clamp(clock.getDelta(), 0, 0.05);
   const wallT = clock.getElapsedTime();
   const tShader = wallT * motionScale;
   material.uniforms.time.value = tShader;
@@ -296,6 +650,8 @@ function tick() {
   }
 
   posAttr.needsUpdate = true;
+
+  updateOrb(arr, dt, tShader);
 
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
