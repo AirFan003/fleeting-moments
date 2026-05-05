@@ -406,9 +406,13 @@ orbGroup.add(orbCenter);
 
 const ORB_EXPAND_DURATION = reducedMotion ? 1.05 : 2.25;
 const ORB_BASE_BRANCH_LEN = 5.65;
+/** Subtle idle pulse while bloom is open (scale + line opacity). */
+const ORB_BREATH_AMP = 0.036;
+const ORB_BREATH_SPEED = 2.65;
 
 const orbState = {
   active: false,
+  closing: false,
   particleIndex: -1,
   animT: 0,
 };
@@ -444,6 +448,26 @@ function pickParticle(clientX, clientY) {
   return best;
 }
 
+/**
+ * Orb bloom hides the field particle; taps use world position of active index (same dot).
+ */
+function hitBloomAnchor(clientX, clientY, pxTolMultiplier = 1.25) {
+  if (!orbState.active || orbState.particleIndex < 0) return false;
+  const rect = canvas.getBoundingClientRect();
+  const arr = geometry.attributes.position.array;
+  const i = orbState.particleIndex;
+  const i3 = i * 3;
+  projScratch.set(arr[i3], arr[i3 + 1], arr[i3 + 2]);
+  projScratch.project(camera);
+  if (projScratch.z <= -1 || projScratch.z >= 1) return false;
+  const sx = (projScratch.x * 0.5 + 0.5) * rect.width;
+  const sy = (-projScratch.y * 0.5 + 0.5) * rect.height;
+  const dx = clientX - rect.left - sx;
+  const dy = clientY - rect.top - sy;
+  const pxTol = PARTICLE_HAND_TARGET.maxDiameterPx * pxTolMultiplier * 1.06;
+  return Math.hypot(dx, dy) <= pxTol;
+}
+
 function restoreOrbParticle() {
   if (orbState.active && orbState.particleIndex >= 0) {
     visibilityAttr[orbState.particleIndex] = 1;
@@ -451,15 +475,21 @@ function restoreOrbParticle() {
   }
 }
 
-function closeOrb() {
+function finishCloseOrb() {
   restoreOrbParticle();
   orbState.active = false;
+  orbState.closing = false;
   orbState.particleIndex = -1;
   orbState.animT = 0;
   orbGroup.visible = false;
 }
 
+function closeOrb() {
+  finishCloseOrb();
+}
+
 function openOrb(particleIndex) {
+  orbState.closing = false;
   restoreOrbParticle();
 
   visibilityAttr[particleIndex] = 0;
@@ -498,10 +528,25 @@ function openOrb(particleIndex) {
   orbGroup.visible = true;
 }
 
+function requestCollapseOrb() {
+  if (!orbState.active) return;
+  if (reducedMotion) {
+    finishCloseOrb();
+    return;
+  }
+  orbState.closing = true;
+}
+
 canvas.addEventListener(
   'pointerdown',
   (e) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return;
+
+    if (orbState.active && hitBloomAnchor(e.clientX, e.clientY)) {
+      requestCollapseOrb();
+      return;
+    }
+
     const picked = pickParticle(e.clientX, e.clientY);
     if (picked >= 0) {
       openOrb(picked);
@@ -515,8 +560,23 @@ canvas.addEventListener(
 function updateOrb(arr, dt, tShader) {
   if (!orbState.active) return;
 
-  orbState.animT = Math.min(1, orbState.animT + dt / ORB_EXPAND_DURATION);
+  if (orbState.closing) {
+    orbState.animT = Math.max(0, orbState.animT - dt / ORB_EXPAND_DURATION);
+    if (orbState.animT <= 0) {
+      orbState.animT = 0;
+      finishCloseOrb();
+      return;
+    }
+  } else {
+    orbState.animT = Math.min(1, orbState.animT + dt / ORB_EXPAND_DURATION);
+  }
+
   const gt = orbState.animT;
+
+  const pulseEnv = easeInOutSine(THREE.MathUtils.clamp((gt - 0.08) / 0.9, 0, 1));
+  const breath =
+    1 +
+    (reducedMotion ? 0 : ORB_BREATH_AMP * Math.sin(tShader * ORB_BREATH_SPEED)) * pulseEnv;
 
   const centerPulse = THREE.MathUtils.lerp(
     1.06,
@@ -536,9 +596,16 @@ function updateOrb(arr, dt, tShader) {
 
   orbCenterMat.uniforms.time.value = tShader;
   orbCenterMat.uniforms.uPixelRatio.value = renderer.getPixelRatio();
-  orbCenterMat.uniforms.uPointScale.value = PARTICLE_HAND_TARGET.pointScale * centerPulse;
+  orbCenterMat.uniforms.uPointScale.value = PARTICLE_HAND_TARGET.pointScale * centerPulse * breath;
 
   tipMat.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+  tipMat.uniforms.uPointScale.value = PARTICLE_HAND_TARGET.pointScale * 0.38 * breath * 0.97;
+
+  if (reducedMotion) {
+    lineMat.opacity = 0.76;
+  } else {
+    lineMat.opacity = THREE.MathUtils.clamp(0.76 * (1 + (breath - 1) * 0.78), 0.63, 0.86);
+  }
 
   const lp = linePositions;
   const tp = tipPositions;
