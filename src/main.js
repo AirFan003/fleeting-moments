@@ -1,5 +1,18 @@
 import * as THREE from 'three';
 
+/** MediaPipe hand landmark indices (https://developers.google.com/mediapipe/solutions/vision/hand_landmarker). */
+const HAND_LM = {
+  THUMB_TIP: 4,
+  INDEX_TIP: 8,
+};
+
+/** Pinch span in normalized image space — tuned for arm's-length webcam. */
+const PINCH_CLOSED = 0.034;
+const PINCH_OPEN = 0.19;
+
+/** Bloom when left pinch exceeds this (after mapping); avoids jitter-opens. */
+const HAND_BLOOM_OPEN_THRESH = 0.07;
+
 /**
  * Visual sizing aimed at later hand-tracking "catch" + photo expansion:
  * slightly smaller sprites than overlap-heavy layouts — pair with seeded grid gaps.
@@ -17,6 +30,7 @@ const VERTEX = /* glsl */ `
   attribute vec3 color;
   attribute float phase;
   attribute float visibility;
+  attribute float highlight;
   uniform float time;
   uniform float uPixelRatio;
   uniform float uPointScale;
@@ -25,14 +39,19 @@ const VERTEX = /* glsl */ `
   varying vec3 vColor;
   varying float vTwinkle;
   varying float vVis;
+  varying float vHighlight;
 
   void main() {
     vVis = visibility;
     vColor = color;
+    vHighlight = clamp(highlight, 0.0, 1.0);
     vTwinkle = 0.72 + 0.28 * sin(time * 0.55 + phase * 6.2831853);
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     float depthScale = uPointScale / max(-mvPosition.z, 1.0);
-    gl_PointSize = clamp(depthScale * uPixelRatio, uPointPxMin, uPointPxMax);
+    /** Full highlight = +50% point diameter vs idle (clearer hand selection). */
+    float sizeMul = mix(1.0, 1.5, vHighlight);
+    float pxMax = mix(uPointPxMax, uPointPxMax * 1.5, vHighlight);
+    gl_PointSize = clamp(depthScale * uPixelRatio * sizeMul, uPointPxMin, pxMax);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -41,16 +60,19 @@ const FRAGMENT = /* glsl */ `
   varying vec3 vColor;
   varying float vTwinkle;
   varying float vVis;
+  varying float vHighlight;
 
   void main() {
     if (vVis < 0.001) discard;
     vec2 c = gl_PointCoord - vec2(0.5);
     float len = length(c);
     if (len > 0.5) discard;
+    float h = clamp(vHighlight, 0.0, 1.0);
     float core = 1.0 - smoothstep(0.0, 0.38, len);
     float glow = exp(-len * 8.5) * 0.22;
-    float alpha = (core * 0.88 + glow * 0.38) * vTwinkle * 0.78 * vVis;
-    gl_FragColor = vec4(vColor * (core + glow * 0.42), alpha);
+    vec3 rgb = vColor * (1.0 + 0.62 * h);
+    float alpha = (core * 0.88 + glow * 0.38) * vTwinkle * 0.78 * vVis * (1.0 + 0.42 * h);
+    gl_FragColor = vec4(rgb * (core + glow * 0.52 * (1.0 + 0.35 * h)), alpha);
   }
 `;
 
@@ -58,6 +80,7 @@ const ORB_CENTER_VERT = /* glsl */ `
   attribute vec3 color;
   attribute float phase;
   attribute float visibility;
+  attribute float highlight;
   uniform float time;
   uniform float uPixelRatio;
   uniform float uPointScale;
@@ -66,14 +89,19 @@ const ORB_CENTER_VERT = /* glsl */ `
   varying vec3 vColor;
   varying float vTwinkle;
   varying float vVis;
+  varying float vHighlight;
 
   void main() {
     vVis = visibility;
     vColor = color;
+    vHighlight = clamp(highlight, 0.0, 1.0);
     vTwinkle = 0.72 + 0.28 * sin(time * 0.55 + phase * 6.2831853);
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     float depthScale = uPointScale / max(-mvPosition.z, 1.0);
-    gl_PointSize = clamp(depthScale * uPixelRatio, uPointPxMin, uPointPxMax);
+    /** Full highlight = +50% point diameter vs idle (clearer hand selection). */
+    float sizeMul = mix(1.0, 1.5, vHighlight);
+    float pxMax = mix(uPointPxMax, uPointPxMax * 1.5, vHighlight);
+    gl_PointSize = clamp(depthScale * uPixelRatio * sizeMul, uPointPxMin, pxMax);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -260,6 +288,11 @@ if (!canvas) {
   throw new Error('Missing #canvas element.');
 }
 
+const webcam = document.getElementById('webcam');
+if (!webcam) {
+  throw new Error('Missing #webcam element.');
+}
+
 const scene = new THREE.Scene();
 
 const camera = new THREE.PerspectiveCamera(58, 1, 0.1, 220);
@@ -298,11 +331,15 @@ const particleColors = colorsFromCategories(particleCategories);
 const visibilityAttr = new Float32Array(COUNT);
 visibilityAttr.fill(1);
 
+const highlightAttr = new Float32Array(COUNT);
+highlightAttr.fill(0);
+
 const geometry = new THREE.BufferGeometry();
 geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 geometry.setAttribute('color', new THREE.BufferAttribute(particleColors, 3));
 geometry.setAttribute('phase', new THREE.BufferAttribute(phases, 1));
 geometry.setAttribute('visibility', new THREE.BufferAttribute(visibilityAttr, 1));
+geometry.setAttribute('highlight', new THREE.BufferAttribute(highlightAttr, 1));
 geometry.computeBoundingSphere();
 
 const material = new THREE.ShaderMaterial({
@@ -383,7 +420,7 @@ centerGeom.setAttribute('position', new THREE.BufferAttribute(centerPos, 3));
 const centerColorArr = new Float32Array(3);
 centerGeom.setAttribute('color', new THREE.BufferAttribute(centerColorArr, 3));
 centerGeom.setAttribute('phase', new THREE.BufferAttribute(new Float32Array([0.35]), 1));
-centerGeom.setAttribute('visibility', new THREE.BufferAttribute(new Float32Array([1]), 1));
+centerGeom.setAttribute('highlight', new THREE.BufferAttribute(new Float32Array([0]), 1));
 
 const orbCenterMat = new THREE.ShaderMaterial({
   uniforms: {
@@ -415,15 +452,20 @@ const orbState = {
   closing: false,
   particleIndex: -1,
   animT: 0,
+  /** When true, opening was triggered by hand; left hand leaving frame will retract the bloom. */
+  openedViaHand: false,
 };
 
 const projScratch = new THREE.Vector3();
 
-function pickParticle(clientX, clientY) {
+/**
+ * @param {boolean} [forFinger] — looser screen radius for index-finger aim (webcam lag / cover crop).
+ */
+function pickParticle(clientX, clientY, forFinger = false) {
   const rect = canvas.getBoundingClientRect();
   const arr = geometry.attributes.position.array;
   const vis = geometry.attributes.visibility.array;
-  const pxTol = PARTICLE_HAND_TARGET.maxDiameterPx * 0.58;
+  const pxTol = PARTICLE_HAND_TARGET.maxDiameterPx * (forFinger ? 0.82 : 0.58);
   let best = -1;
   let bestD = Infinity;
 
@@ -481,6 +523,7 @@ function finishCloseOrb() {
   orbState.closing = false;
   orbState.particleIndex = -1;
   orbState.animT = 0;
+  orbState.openedViaHand = false;
   orbGroup.visible = false;
 }
 
@@ -488,9 +531,10 @@ function closeOrb() {
   finishCloseOrb();
 }
 
-function openOrb(particleIndex) {
+function openOrb(particleIndex, { viaHand = false } = {}) {
   orbState.closing = false;
   restoreOrbParticle();
+  orbState.openedViaHand = viaHand;
 
   visibilityAttr[particleIndex] = 0;
   geometry.attributes.visibility.needsUpdate = true;
@@ -557,10 +601,19 @@ canvas.addEventListener(
   { passive: true },
 );
 
-function updateOrb(arr, dt, tShader) {
+function updateOrb(arr, dt, tShader, handBloomDrive) {
   if (!orbState.active) return;
 
-  if (orbState.closing) {
+  if (handBloomDrive != null) {
+    orbState.closing = false;
+    const target = THREE.MathUtils.clamp(handBloomDrive.target, 0, 1);
+    orbState.animT = THREE.MathUtils.damp(orbState.animT, target, 14.5, dt);
+    if (target < 0.028 && orbState.animT < 0.035) {
+      orbState.animT = 0;
+      finishCloseOrb();
+      return;
+    }
+  } else if (orbState.closing) {
     orbState.animT = Math.max(0, orbState.animT - dt / ORB_EXPAND_DURATION);
     if (orbState.animT <= 0) {
       orbState.animT = 0;
@@ -651,6 +704,228 @@ function updateOrb(arr, dt, tShader) {
   tipGeom.attributes.position.needsUpdate = true;
 }
 
+/* ---------- MediaPipe hands → selection + pinch bloom ---------- */
+
+const handPipe = {
+  landmarker: null,
+  lastVideoTime: -1,
+  leftPresent: false,
+  rightPresent: false,
+  pinchOpen01: 0,
+  smoothedPinch: 0,
+  /** Stabilized index under right index finger (-1 if none). */
+  effectivePick: -1,
+};
+
+/** Require this many consecutive matching raw picks before swapping hover (reduces flicker). */
+const FINGER_PICK_HOLD_FRAMES = 4;
+
+const fingerPickHyst = {
+  stable: -1,
+  candidate: -1,
+  streak: 0,
+  miss: 0,
+};
+
+function updateStableFingerPick(rawIndex) {
+  if (rawIndex < 0) {
+    fingerPickHyst.miss++;
+    if (fingerPickHyst.miss > 10) {
+      fingerPickHyst.stable = -1;
+      fingerPickHyst.candidate = -1;
+      fingerPickHyst.streak = 0;
+    }
+    return fingerPickHyst.stable;
+  }
+  fingerPickHyst.miss = 0;
+  if (rawIndex === fingerPickHyst.stable) {
+    fingerPickHyst.candidate = -1;
+    fingerPickHyst.streak = 0;
+    return fingerPickHyst.stable;
+  }
+  if (rawIndex === fingerPickHyst.candidate) {
+    fingerPickHyst.streak++;
+  } else {
+    fingerPickHyst.candidate = rawIndex;
+    fingerPickHyst.streak = 1;
+  }
+  if (fingerPickHyst.streak >= FINGER_PICK_HOLD_FRAMES) {
+    fingerPickHyst.stable = fingerPickHyst.candidate;
+    fingerPickHyst.candidate = -1;
+    fingerPickHyst.streak = 0;
+  }
+  return fingerPickHyst.stable;
+}
+
+/**
+ * Map a normalized landmark to window client coords for a full-viewport mirrored video
+ * using object-fit: cover (matches #webcam and #canvas stacking).
+ */
+function landmarkToCanvasClient(lm) {
+  const rect = canvas.getBoundingClientRect();
+  const vw = webcam.videoWidth || 1;
+  const vh = webcam.videoHeight || 1;
+  const cw = Math.max(1, rect.width);
+  const ch = Math.max(1, rect.height);
+  const scale = Math.max(cw / vw, ch / vh);
+  const dispW = vw * scale;
+  const dispH = vh * scale;
+  const ox = (cw - dispW) * 0.5;
+  const oy = (ch - dispH) * 0.5;
+  const nx = 1.0 - lm.x;
+  const ny = lm.y;
+  return {
+    clientX: rect.left + ox + nx * dispW,
+    clientY: rect.top + oy + ny * dispH,
+  };
+}
+
+function pinchSpan(lms) {
+  const t = lms[HAND_LM.THUMB_TIP];
+  const i = lms[HAND_LM.INDEX_TIP];
+  return Math.hypot(t.x - i.x, t.y - i.y);
+}
+
+/** Map pinch span to ~0 (pinched) … ~1 (spread). */
+function pinchToOpen01(span) {
+  const u = THREE.MathUtils.clamp(
+    (span - PINCH_CLOSED) / Math.max(1e-5, PINCH_OPEN - PINCH_CLOSED),
+    0,
+    1,
+  );
+  return u * u;
+}
+
+async function startWebcam(video) {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+async function initHandTracking() {
+  if (!navigator.mediaDevices?.getUserMedia) return;
+
+  try {
+    await startWebcam(webcam);
+  } catch (e) {
+    console.warn('[hands] Webcam unavailable:', e);
+    return;
+  }
+
+  try {
+    const { FilesetResolver, HandLandmarker } = await import('@mediapipe/tasks-vision');
+    const vision = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm',
+    );
+    const baseOptions = {
+      modelAssetPath:
+        'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+    };
+    try {
+      handPipe.landmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { ...baseOptions, delegate: 'GPU' },
+        runningMode: 'VIDEO',
+        numHands: 2,
+      });
+    } catch {
+      handPipe.landmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions,
+        runningMode: 'VIDEO',
+        numHands: 2,
+      });
+    }
+  } catch (e) {
+    console.warn('[hands] MediaPipe init failed:', e);
+  }
+}
+
+void initHandTracking();
+
+function runHandLandmarker(dt) {
+  const lm = handPipe.landmarker;
+  if (!lm || webcam.readyState < 2) {
+    handPipe.leftPresent = false;
+    handPipe.rightPresent = false;
+    handPipe.pinchOpen01 = 0;
+    handPipe.smoothedPinch = THREE.MathUtils.damp(handPipe.smoothedPinch, 0, 10, dt);
+    return;
+  }
+
+  if (webcam.currentTime === handPipe.lastVideoTime) {
+    return;
+  }
+  handPipe.lastVideoTime = webcam.currentTime;
+
+  handPipe.leftPresent = false;
+  handPipe.rightPresent = false;
+  handPipe.pinchOpen01 = 0;
+
+  let result;
+  try {
+    result = lm.detectForVideo(webcam, performance.now());
+  } catch {
+    return;
+  }
+
+  const marks = result?.landmarks;
+  const handed = result?.handednesses;
+  if (!marks?.length) {
+    handPipe.smoothedPinch = THREE.MathUtils.damp(handPipe.smoothedPinch, 0, 12, dt);
+    return;
+  }
+
+  let leftLms = null;
+  let rightLms = null;
+  for (let i = 0; i < marks.length; i++) {
+    const label = handed?.[i]?.[0]?.categoryName ?? '';
+    if (label === 'Left') leftLms = marks[i];
+    else if (label === 'Right') rightLms = marks[i];
+  }
+
+  if (rightLms) {
+    handPipe.rightPresent = true;
+    const tip = rightLms[HAND_LM.INDEX_TIP];
+    const { clientX, clientY } = landmarkToCanvasClient(tip);
+    const rawPick = pickParticle(clientX, clientY, true);
+    handPipe.effectivePick = updateStableFingerPick(rawPick);
+  } else {
+    handPipe.effectivePick = updateStableFingerPick(-1);
+  }
+
+  if (leftLms) {
+    handPipe.leftPresent = true;
+    const span = pinchSpan(leftLms);
+    handPipe.pinchOpen01 = pinchToOpen01(span);
+    handPipe.smoothedPinch = THREE.MathUtils.damp(
+      handPipe.smoothedPinch,
+      handPipe.pinchOpen01,
+      20,
+      dt,
+    );
+  } else {
+    handPipe.smoothedPinch = THREE.MathUtils.damp(handPipe.smoothedPinch, 0, 14, dt);
+  }
+}
+
+/** Step 1: hand controls hover highlight only; pinch bloom re-enabled later. */
+function buildHandBloomDrive() {
+  return null;
+}
+
+function updateFingerHoverHighlights(dt) {
+  const hi = geometry.attributes.highlight.array;
+  const targetIdx = handPipe.rightPresent ? handPipe.effectivePick : -1;
+  const λ = 20;
+  for (let i = 0; i < COUNT; i++) {
+    const t = targetIdx >= 0 && i === targetIdx ? 1 : 0;
+    hi[i] = THREE.MathUtils.damp(hi[i], t, λ, dt);
+  }
+  geometry.attributes.highlight.needsUpdate = true;
+}
+
 /* ---------- Main loop ---------- */
 
 const clock = new THREE.Clock();
@@ -718,7 +993,9 @@ function tick() {
 
   posAttr.needsUpdate = true;
 
-  updateOrb(arr, dt, tShader);
+  runHandLandmarker(dt);
+  updateFingerHoverHighlights(dt);
+  updateOrb(arr, dt, tShader, buildHandBloomDrive());
 
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
