@@ -2,13 +2,12 @@ import * as THREE from 'three';
 
 /**
  * Visual sizing aimed at later hand-tracking "catch" + photo expansion:
- * keep sprites large enough for forgiving overlap checks in screen space.
- * Pair `pointScale` with particle depth (~34); tune min/max px if grabs feel tight.
+ * slightly smaller sprites than overlap-heavy layouts — pair with seeded grid gaps.
  */
 const PARTICLE_HAND_TARGET = {
-  pointScale: 1050,
-  minDiameterPx: 42,
-  maxDiameterPx: 450,
+  pointScale: 950,
+  minDiameterPx: 36,
+  maxDiameterPx: 380,
 };
 
 const VERTEX = /* glsl */ `
@@ -102,26 +101,64 @@ function verticalFallExtents(cam, zWorld) {
   return { top, bottom, span: top - bottom, halfH };
 }
 
-/** Seeds horizontal spread + depth anchors; vertical motion is computed each frame. */
+/**
+ * Rows/cols biased by aspect so we don't pile many particles in one screen column:
+ * portrait → more rows than cols, landscape → the opposite (still aspect-aware caps).
+ */
+function seedGridExtents(count, aspect) {
+  if (count <= 0) return { cols: 1, rows: 1 };
+  const ratio = THREE.MathUtils.clamp(aspect, 0.62, 2.42);
+  const squareish = Math.sqrt(count);
+  const cols = THREE.MathUtils.clamp(
+    Math.ceil(squareish * ratio * 1.12),
+    3,
+    Math.max(3, count),
+  );
+  const rows = Math.ceil(count / cols);
+  return { cols: Math.min(cols, count), rows };
+}
+
+/**
+ * Lattice + brick staggering for separation in screen space; depth step tracks lateral cell
+ * width so stacked rows don't land on nearly the same pixel column.
+ */
 function seedParticlesHorizontal(base, cam, count) {
   const z0 = -34;
   const dist = -z0;
   const halfV = Math.tan(THREE.MathUtils.degToRad(cam.fov * 0.5));
   const halfH = halfV * dist;
   const halfW = halfH * cam.aspect;
-  const margin = 0.72;
-  const COLS = 5;
-  const ROWS = 4;
+
+  const { cols, rows } = seedGridExtents(count, cam.aspect);
+  /** Use nearly full lateral frustum → larger centres-to-centres gap. */
+  const lateralFrac = 0.95;
+  const gridHalfW = halfW * lateralFrac;
+
+  /** Slightly narrower cells when rows are staggered so nothing clips past ±gridHalfW. */
+  const colDen = cols + (rows > 1 ? 0.54 : 0);
+  const cellW = Math.max((2 * gridHalfW) / colDen, 0.055);
+
+  /**
+   * Separate row planes roughly as wide as lateral cells (~isotropic pairwise spacing in XZ).
+   */
+  const zStep = THREE.MathUtils.clamp(cellW * (rows > 2 ? 1.08 : 1.14), 1.82, cellW * 1.74);
+  const depthBand = rows > 1 ? zStep * (rows - 1) : zStep;
+
+  const jitterFrac = 0.03;
+  const jxMax = Math.min(cellW * jitterFrac, 0.06);
+  const jzMax = Math.min(rows > 1 ? zStep * jitterFrac : depthBand * jitterFrac * 0.55, 0.09);
 
   for (let i = 0; i < count; i++) {
-    const col = i % COLS;
-    const row = Math.floor(i / COLS);
-    const u = (col + 0.5) / COLS;
-    const gx = (u - 0.5) * 2 * halfW * margin + (Math.random() - 0.5) * 2;
-    const rowSkew = ((row + 0.5) / ROWS - 0.5) * halfW * 0.12;
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+
+    const brick = (row & 1) * (cellW * 0.5);
+    const cx = -gridHalfW + (col + 0.5) * cellW + brick;
+    const cz = rows > 1 ? z0 + (row / (rows - 1) - 0.5) * depthBand : z0;
+
     const i3 = i * 3;
-    base[i3] = gx + rowSkew;
-    base[i3 + 2] = z0 + (Math.random() - 0.5) * 2.5;
+    base[i3] = cx + (Math.random() - 0.5) * 2 * jxMax;
+    base[i3 + 2] = cz + (Math.random() - 0.5) * 2 * jzMax;
   }
 }
 
@@ -244,18 +281,18 @@ function tick() {
     const bz = basePositions[i3 + 2];
     const seed = phases[i] * 12.9898;
 
-    const flowX = mouse.x * 0.55 + Math.sin(tShader * 0.055 + seed) * 0.35;
+    const flowX = mouse.x * 0.38 + Math.sin(tShader * 0.055 + seed) * 0.14;
 
     const progress = modSafe(phases[i] * span + wallT * fallSpeed, span);
     const y = top - progress;
 
-    arr[i3] = bx + Math.sin(tShader * 0.07 + seed * 1.7 + flowX * 0.08) * 0.55 + mouse.x * 0.9;
-    arr[i3 + 1] =
-      y +
-      Math.cos(tShader * 0.06 + seed * 1.1) * 0.22 +
-      mouse.y * 0.55;
+    arr[i3] =
+      bx + Math.sin(tShader * 0.07 + seed * 1.7 + flowX * 0.048) * 0.17 + mouse.x * 0.62;
+    arr[i3 + 1] = y + Math.cos(tShader * 0.06 + seed * 1.1) * 0.1 + mouse.y * 0.42;
     arr[i3 + 2] =
-      bz + Math.sin(tShader * 0.045 + phases[i] * 8) * 0.35 + Math.cos(tShader * 0.03 + seed) * 0.12;
+      bz +
+      Math.sin(tShader * 0.045 + phases[i] * 8) * 0.13 +
+      Math.cos(tShader * 0.03 + seed) * 0.06;
   }
 
   posAttr.needsUpdate = true;
