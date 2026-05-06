@@ -120,29 +120,39 @@ const ORB_CENTER_VERT = /* glsl */ `
 
 const ORB_TIP_VERT = /* glsl */ `
   attribute vec3 color;
+  attribute float tipFocus;
   uniform float uPixelRatio;
   uniform float uPointScale;
   uniform float uPointPxMin;
   uniform float uPointPxMax;
+  uniform float uFocusScaleMin;
+  uniform float uFocusScaleMax;
   varying vec3 vColor;
+  varying float vFocus;
 
   void main() {
     vColor = color;
+    vFocus = clamp(tipFocus, 0.0, 1.0);
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     float depthScale = uPointScale / max(-mvPosition.z, 1.0);
-    gl_PointSize = clamp(depthScale * uPixelRatio, uPointPxMin, uPointPxMax);
+    float focusMul = mix(uFocusScaleMin, uFocusScaleMax, vFocus);
+    gl_PointSize = clamp(depthScale * uPixelRatio * focusMul, uPointPxMin, uPointPxMax * 1.35);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
 
 const ORB_TIP_FRAG = /* glsl */ `
   varying vec3 vColor;
+  varying float vFocus;
 
   void main() {
     vec2 c = gl_PointCoord - vec2(0.5);
     float r = length(c);
     if (r > 0.49 || r < 0.32) discard;
-    gl_FragColor = vec4(vColor, 0.94);
+    float h = clamp(vFocus, 0.0, 1.0);
+    vec3 rgb = vColor * (1.0 + 0.72 * h);
+    float a = 0.62 + 0.38 * h;
+    gl_FragColor = vec4(rgb, a);
   }
 `;
 
@@ -275,24 +285,6 @@ function syncCameraAspect(cam) {
   cam.updateProjectionMatrix();
 }
 
-function fillFibonacciDirections(outDirs, n, jitterStrength, scratch, randFn) {
-  const golden = Math.PI * (3 - Math.sqrt(5));
-  for (let i = 0; i < n; i++) {
-    const y = n > 1 ? 1 - (i / (n - 1)) * 2 : 0;
-    const r = Math.sqrt(Math.max(0, 1 - y * y));
-    const theta = golden * i;
-    scratch.set(Math.cos(theta) * r, y, Math.sin(theta) * r);
-    scratch.x += (randFn() - 0.5) * jitterStrength;
-    scratch.y += (randFn() - 0.5) * jitterStrength;
-    scratch.z += (randFn() - 0.5) * jitterStrength;
-    scratch.normalize();
-    const i3 = i * 3;
-    outDirs[i3] = scratch.x;
-    outDirs[i3 + 1] = scratch.y;
-    outDirs[i3 + 2] = scratch.z;
-  }
-}
-
 const reducedMotion = prefersReducedMotion();
 
 const canvas = document.getElementById('canvas');
@@ -380,23 +372,22 @@ points.frustumCulled = false;
 points.renderOrder = 999;
 scene.add(points);
 
-/* ---------- Tap → radial orb (lines + hollow tip nodes; ready for image quads later) ---------- */
+/* ---------- Expanded bloom: 3D ring carousel (photo slots at tips; twist = sift) ---------- */
 
 const orbGroup = new THREE.Group();
 orbGroup.visible = false;
 orbGroup.renderOrder = 1002;
 scene.add(orbGroup);
 
-const orbDirs = new Float32Array(ORB_BRANCH_COUNT * 3);
-/** Snapshot of branch axes at orb open — twist rotates these in `updateOrb`. */
-const orbDirsBase = new Float32Array(ORB_BRANCH_COUNT * 3);
+const orbRingJitter = new Float32Array(ORB_BRANCH_COUNT);
 const orbLenJit = new Float32Array(ORB_BRANCH_COUNT);
 const orbBranchStagger = new Float32Array(ORB_BRANCH_COUNT);
 const dirScratch = new THREE.Vector3();
 const bendAxisScratch = new THREE.Vector3();
 const worldUp = new THREE.Vector3(0, 1, 0);
+const ringE0 = new THREE.Vector3();
+const ringE1 = new THREE.Vector3();
 const bloomTwistAxis = new THREE.Vector3();
-const bloomTwistQuat = new THREE.Quaternion();
 
 const linePositions = new Float32Array(ORB_BRANCH_COUNT * 2 * 3);
 const lineGeom = new THREE.BufferGeometry();
@@ -413,9 +404,11 @@ orbGroup.add(orbLines);
 
 const tipPositions = new Float32Array(ORB_BRANCH_COUNT * 3);
 const tipColors = new Float32Array(ORB_BRANCH_COUNT * 3);
+const tipFocusAttr = new Float32Array(ORB_BRANCH_COUNT);
 const tipGeom = new THREE.BufferGeometry();
 tipGeom.setAttribute('position', new THREE.BufferAttribute(tipPositions, 3));
 tipGeom.setAttribute('color', new THREE.BufferAttribute(tipColors, 3));
+tipGeom.setAttribute('tipFocus', new THREE.BufferAttribute(tipFocusAttr, 1));
 
 const tipMat = new THREE.ShaderMaterial({
   uniforms: {
@@ -423,6 +416,8 @@ const tipMat = new THREE.ShaderMaterial({
     uPointScale: { value: PARTICLE_HAND_TARGET.pointScale * 0.38 },
     uPointPxMin: { value: 10 },
     uPointPxMax: { value: 96 },
+    uFocusScaleMin: { value: 0.74 },
+    uFocusScaleMax: { value: 1.62 },
   },
   vertexShader: ORB_TIP_VERT,
   fragmentShader: ORB_TIP_FRAG,
@@ -464,6 +459,12 @@ orbGroup.add(orbCenter);
 
 const ORB_EXPAND_DURATION = reducedMotion ? 1.05 : 2.25;
 const ORB_BASE_BRANCH_LEN = 5.65;
+/** Toward-camera shift for the twist-focused photo slot (carousel depth). */
+const ORB_FOCUS_DEPTH = 2.15;
+/** Higher = more "one at a time" when scrolling with wrist twist. */
+const ORB_FOCUS_SHARPNESS = 2.35;
+/** Subtle 3D: lift/back ring so it reads as a shallow bowl, not a flat sticker. */
+const ORB_RING_DEPTH_WARP = 0.42;
 /** Subtle idle pulse while bloom is open (scale + line opacity). */
 const ORB_BREATH_AMP = 0.036;
 const ORB_BREATH_SPEED = 2.65;
@@ -479,6 +480,8 @@ const orbState = {
   lastPinchBloomTarget: 0,
   /** Last branch twist (rad) when left hand was driving; held if hand briefly lost. */
   lastHandBloomTwist: 0,
+  /** Branch index with highest tipFocus this frame (0…ORB_BRANCH_COUNT-1) — for future photoTextures[i]. */
+  bloomFocusIndex: -1,
 };
 
 const projScratch = new THREE.Vector3();
@@ -551,6 +554,7 @@ function finishCloseOrb() {
   orbState.openedViaHand = false;
   orbState.lastPinchBloomTarget = 0;
   orbState.lastHandBloomTwist = 0;
+  orbState.bloomFocusIndex = -1;
   handPipe.leftTwistZeroRef = null;
   handPipe.leftTwistCos = 1;
   handPipe.leftTwistSin = 0;
@@ -571,9 +575,8 @@ function openOrb(particleIndex, { viaHand = false, initialAnimT = 0 } = {}) {
   visibilityAttr[particleIndex] = 0;
   geometry.attributes.visibility.needsUpdate = true;
 
-  fillFibonacciDirections(orbDirs, ORB_BRANCH_COUNT, 0.14, dirScratch, Math.random);
-  orbDirsBase.set(orbDirs);
   for (let i = 0; i < ORB_BRANCH_COUNT; i++) {
+    orbRingJitter[i] = (Math.random() - 0.5) * 0.24;
     orbLenJit[i] = 0.88 + Math.random() * 0.2;
     const u = Math.random();
     orbBranchStagger[i] = u ** 1.45 * 0.72;
@@ -716,19 +719,33 @@ function updateOrb(arr, dt, tShader, handBloomDrive) {
   } else {
     bloomTwistAxis.normalize();
   }
-  bloomTwistQuat.setFromAxisAngle(bloomTwistAxis, bloomTwistRad);
+  const toCam = bloomTwistAxis;
+
+  ringE0.copy(worldUp).cross(toCam);
+  if (ringE0.lengthSq() < 1e-10) {
+    ringE0.set(1, 0, 0).cross(toCam);
+  }
+  ringE0.normalize();
+  ringE1.crossVectors(toCam, ringE0).normalize();
 
   const lp = linePositions;
   const tp = tipPositions;
+  const tipF = tipFocusAttr;
+  const twoPi = Math.PI * 2;
 
   for (let i = 0; i < ORB_BRANCH_COUNT; i++) {
     const i3 = i * 3;
     const i6 = i * 6;
-    dirScratch.set(orbDirsBase[i3], orbDirsBase[i3 + 1], orbDirsBase[i3 + 2]);
-    dirScratch.applyQuaternion(bloomTwistQuat);
-    const dx = dirScratch.x;
-    const dy = dirScratch.y;
-    const dz = dirScratch.z;
+    const ang = (twoPi * i) / ORB_BRANCH_COUNT + orbRingJitter[i] + bloomTwistRad;
+    const c = Math.cos(ang);
+    const s = Math.sin(ang);
+    const slotT = (c + 1) * 0.5;
+    const forwardWeight = Math.pow(slotT, ORB_FOCUS_SHARPNESS);
+
+    dirScratch.copy(ringE0).multiplyScalar(c).addScaledVector(ringE1, s);
+    const ringWarp = Math.sin(ang * 2) * ORB_RING_DEPTH_WARP;
+    dirScratch.addScaledVector(toCam, ringWarp);
+    dirScratch.normalize();
 
     const start = orbBranchStagger[i];
     const denom = Math.max(1e-5, 1 - start);
@@ -736,17 +753,19 @@ function updateOrb(arr, dt, tShader, handBloomDrive) {
     const branchE = easeInOutSine(THREE.MathUtils.clamp(branchLinear, 0, 1));
 
     const L = ORB_BASE_BRANCH_LEN * orbLenJit[i] * branchE;
+    const depthPush = ORB_FOCUS_DEPTH * forwardWeight * branchE;
 
-    bendAxisScratch.set(dx, dy, dz).cross(worldUp);
-    if (bendAxisScratch.lengthSq() < 1e-8) {
-      bendAxisScratch.set(1, 0, 0);
+    bendAxisScratch.copy(dirScratch).cross(toCam);
+    if (bendAxisScratch.lengthSq() < 1e-10) {
+      bendAxisScratch.copy(ringE1);
+    } else {
+      bendAxisScratch.normalize();
     }
-    bendAxisScratch.normalize();
-    const sag = easeInOutSine(branchE) * 0.19;
+    const sag = easeInOutSine(branchE) * 0.12;
 
-    const ox = dx * L + bendAxisScratch.x * sag;
-    const oy = dy * L + bendAxisScratch.y * sag;
-    const oz = dz * L + bendAxisScratch.z * sag;
+    const ox = dirScratch.x * L + toCam.x * depthPush + bendAxisScratch.x * sag;
+    const oy = dirScratch.y * L + toCam.y * depthPush + bendAxisScratch.y * sag;
+    const oz = dirScratch.z * L + toCam.z * depthPush + bendAxisScratch.z * sag;
 
     lp[i6] = cx;
     lp[i6 + 1] = cy;
@@ -758,10 +777,19 @@ function updateOrb(arr, dt, tShader, handBloomDrive) {
     tp[i3] = lp[i6 + 3];
     tp[i3 + 1] = lp[i6 + 4];
     tp[i3 + 2] = lp[i6 + 5];
+
+    tipF[i] = forwardWeight;
   }
 
   lineGeom.attributes.position.needsUpdate = true;
   tipGeom.attributes.position.needsUpdate = true;
+  tipGeom.attributes.tipFocus.needsUpdate = true;
+
+  let bestIdx = 0;
+  for (let i = 1; i < ORB_BRANCH_COUNT; i++) {
+    if (tipF[i] > tipF[bestIdx]) bestIdx = i;
+  }
+  orbState.bloomFocusIndex = gt > 0.04 && tipF[bestIdx] > 0.08 ? bestIdx : -1;
 }
 
 /* ---------- MediaPipe hands → selection + pinch bloom ---------- */
