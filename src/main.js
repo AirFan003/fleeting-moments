@@ -4,6 +4,8 @@ import * as THREE from 'three';
 const HAND_LM = {
   THUMB_TIP: 4,
   INDEX_TIP: 8,
+  INDEX_MCP: 5,
+  PINKY_MCP: 17,
 };
 
 /** Pinch span in normalized image space — tuned for arm's-length webcam. */
@@ -18,6 +20,10 @@ const HAND_BLOOM_OPEN_THRESH = 0.07;
  * without pinching all the way shut.
  */
 const HAND_PINCH_END_SESSION = 0.14;
+
+/** Bloom branch twist: palm roll vs opening pose (radians → scene, flip if rotation feels inverted). */
+const HAND_BLOOM_TWIST_GAIN = 1.22;
+const HAND_BLOOM_TWIST_FLIP = -1;
 
 /**
  * Visual sizing aimed at later hand-tracking "catch" + photo expansion:
@@ -382,11 +388,15 @@ orbGroup.renderOrder = 1002;
 scene.add(orbGroup);
 
 const orbDirs = new Float32Array(ORB_BRANCH_COUNT * 3);
+/** Snapshot of branch axes at orb open — twist rotates these in `updateOrb`. */
+const orbDirsBase = new Float32Array(ORB_BRANCH_COUNT * 3);
 const orbLenJit = new Float32Array(ORB_BRANCH_COUNT);
 const orbBranchStagger = new Float32Array(ORB_BRANCH_COUNT);
 const dirScratch = new THREE.Vector3();
 const bendAxisScratch = new THREE.Vector3();
 const worldUp = new THREE.Vector3(0, 1, 0);
+const bloomTwistAxis = new THREE.Vector3();
+const bloomTwistQuat = new THREE.Quaternion();
 
 const linePositions = new Float32Array(ORB_BRANCH_COUNT * 2 * 3);
 const lineGeom = new THREE.BufferGeometry();
@@ -467,6 +477,8 @@ const orbState = {
   openedViaHand: false,
   /** Last mapped pinch openness when left hand was seen; used to hold bloom if left hand briefly leaves. */
   lastPinchBloomTarget: 0,
+  /** Last branch twist (rad) when left hand was driving; held if hand briefly lost. */
+  lastHandBloomTwist: 0,
 };
 
 const projScratch = new THREE.Vector3();
@@ -538,6 +550,10 @@ function finishCloseOrb() {
   orbState.animT = 0;
   orbState.openedViaHand = false;
   orbState.lastPinchBloomTarget = 0;
+  orbState.lastHandBloomTwist = 0;
+  handPipe.leftTwistZeroRef = null;
+  handPipe.leftTwistCos = 1;
+  handPipe.leftTwistSin = 0;
   orbGroup.visible = false;
 }
 
@@ -549,11 +565,14 @@ function openOrb(particleIndex, { viaHand = false, initialAnimT = 0 } = {}) {
   orbState.closing = false;
   restoreOrbParticle();
   orbState.openedViaHand = viaHand;
+  orbState.lastHandBloomTwist = 0;
+  handPipe.leftTwistZeroRef = null;
 
   visibilityAttr[particleIndex] = 0;
   geometry.attributes.visibility.needsUpdate = true;
 
   fillFibonacciDirections(orbDirs, ORB_BRANCH_COUNT, 0.14, dirScratch, Math.random);
+  orbDirsBase.set(orbDirs);
   for (let i = 0; i < ORB_BRANCH_COUNT; i++) {
     orbLenJit[i] = 0.88 + Math.random() * 0.2;
     const u = Math.random();
@@ -679,15 +698,37 @@ function updateOrb(arr, dt, tShader, handBloomDrive) {
     lineMat.opacity = THREE.MathUtils.clamp(0.76 * (1 + (breath - 1) * 0.78), 0.63, 0.86);
   }
 
+  let bloomTwistRad = orbState.lastHandBloomTwist;
+  if (handPipe.leftTwistZeroRef !== null) {
+    const cur = Math.atan2(handPipe.leftTwistSin, handPipe.leftTwistCos);
+    let d = cur - handPipe.leftTwistZeroRef;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    bloomTwistRad = d * HAND_BLOOM_TWIST_GAIN * HAND_BLOOM_TWIST_FLIP;
+    if (handPipe.leftPresent) {
+      orbState.lastHandBloomTwist = bloomTwistRad;
+    }
+  }
+
+  bloomTwistAxis.set(camera.position.x - cx, camera.position.y - cy, camera.position.z - cz);
+  if (bloomTwistAxis.lengthSq() < 1e-10) {
+    bloomTwistAxis.set(0, 0, 1);
+  } else {
+    bloomTwistAxis.normalize();
+  }
+  bloomTwistQuat.setFromAxisAngle(bloomTwistAxis, bloomTwistRad);
+
   const lp = linePositions;
   const tp = tipPositions;
 
   for (let i = 0; i < ORB_BRANCH_COUNT; i++) {
     const i3 = i * 3;
     const i6 = i * 6;
-    const dx = orbDirs[i3];
-    const dy = orbDirs[i3 + 1];
-    const dz = orbDirs[i3 + 2];
+    dirScratch.set(orbDirsBase[i3], orbDirsBase[i3 + 1], orbDirsBase[i3 + 2]);
+    dirScratch.applyQuaternion(bloomTwistQuat);
+    const dx = dirScratch.x;
+    const dy = dirScratch.y;
+    const dz = dirScratch.z;
 
     const start = orbBranchStagger[i];
     const denom = Math.max(1e-5, 1 - start);
@@ -734,6 +775,11 @@ const handPipe = {
   smoothedPinch: 0,
   /** Stabilized index under right index finger (-1 if none). */
   effectivePick: -1,
+  /** Smoothed palm twist (cos/sin of angle in image plane, index→pinky). */
+  leftTwistCos: 1,
+  leftTwistSin: 0,
+  /** Reference angle (rad) when bloom opened or left first engaged — twist is relative to this. */
+  leftTwistZeroRef: null,
 };
 
 /** Require this many consecutive matching raw picks before swapping hover (reduces flicker). */
@@ -925,6 +971,18 @@ function runHandLandmarker(dt) {
       20,
       dt,
     );
+
+    const im = leftLms[HAND_LM.INDEX_MCP];
+    const pm = leftLms[HAND_LM.PINKY_MCP];
+    const rawTwist = Math.atan2(pm.y - im.y, pm.x - im.x);
+    const tc = Math.cos(rawTwist);
+    const ts = Math.sin(rawTwist);
+    handPipe.leftTwistCos = THREE.MathUtils.damp(handPipe.leftTwistCos, tc, 16, dt);
+    handPipe.leftTwistSin = THREE.MathUtils.damp(handPipe.leftTwistSin, ts, 16, dt);
+
+    if (orbState.active && handPipe.leftTwistZeroRef === null) {
+      handPipe.leftTwistZeroRef = Math.atan2(handPipe.leftTwistSin, handPipe.leftTwistCos);
+    }
   } else {
     handPipe.smoothedPinch = THREE.MathUtils.damp(handPipe.smoothedPinch, 0, 14, dt);
   }
@@ -939,6 +997,7 @@ function buildHandBloomDrive() {
     if (!handPipe.rightPresent || handPipe.effectivePick < 0) return null;
     openOrb(handPipe.effectivePick, { viaHand: true, initialAnimT: pinch });
     orbState.lastPinchBloomTarget = pinch;
+    handPipe.leftTwistZeroRef = Math.atan2(handPipe.leftTwistSin, handPipe.leftTwistCos);
     return { target: pinch };
   }
 
