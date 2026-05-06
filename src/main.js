@@ -463,8 +463,16 @@ const ORB_BASE_BRANCH_LEN = 5.65;
 const ORB_FOCUS_DEPTH = 2.15;
 /** Higher = more "one at a time" when scrolling with wrist twist. */
 const ORB_FOCUS_SHARPNESS = 2.35;
-/** Subtle 3D: lift/back ring so it reads as a shallow bowl, not a flat sticker. */
-const ORB_RING_DEPTH_WARP = 0.42;
+/** Spherical-cap spread: tips sit on a shallow dome (not a flat ring). */
+const ORB_CAP_ELEVATION = 0.48;
+/** Extra push along view axis as twist runs — reads as Z/depth motion while rotating. */
+const ORB_TWIST_VIEW_WAVE = 1.55;
+/** Lateral wave in the ring plane, phase-locked to twist (helix feel). */
+const ORB_HELIX_LATERAL = 0.78;
+/** Small world-up bob so tips aren’t locked to one plane. */
+const ORB_WORLD_LIFT = 0.58;
+/** Minor corrugation before normalizing branch direction. */
+const ORB_RING_DEPTH_WARP = 0.36;
 /** Subtle idle pulse while bloom is open (scale + line opacity). */
 const ORB_BREATH_AMP = 0.036;
 const ORB_BREATH_SPEED = 2.65;
@@ -742,9 +750,22 @@ function updateOrb(arr, dt, tShader, handBloomDrive) {
     const slotT = (c + 1) * 0.5;
     const forwardWeight = Math.pow(slotT, ORB_FOCUS_SHARPNESS);
 
-    dirScratch.copy(ringE0).multiplyScalar(c).addScaledVector(ringE1, s);
-    const ringWarp = Math.sin(ang * 2) * ORB_RING_DEPTH_WARP;
-    dirScratch.addScaledVector(toCam, ringWarp);
+    const elev =
+      Math.sin(ang * 1.4 + bloomTwistRad * 0.92) * ORB_CAP_ELEVATION +
+      Math.sin(ang * 2.05 - bloomTwistRad * 1.18) * (ORB_CAP_ELEVATION * 0.42);
+    const ce = Math.cos(elev);
+    const se = Math.sin(elev);
+
+    dirScratch
+      .copy(ringE0)
+      .multiplyScalar(ce * c)
+      .addScaledVector(ringE1, ce * s)
+      .addScaledVector(toCam, se);
+
+    dirScratch.addScaledVector(
+      toCam,
+      ORB_RING_DEPTH_WARP * 0.42 * Math.sin(ang * 2 + bloomTwistRad * 1.12),
+    );
     dirScratch.normalize();
 
     const start = orbBranchStagger[i];
@@ -755,6 +776,15 @@ function updateOrb(arr, dt, tShader, handBloomDrive) {
     const L = ORB_BASE_BRANCH_LEN * orbLenJit[i] * branchE;
     const depthPush = ORB_FOCUS_DEPTH * forwardWeight * branchE;
 
+    const m3d = reducedMotion ? 0.44 : 1;
+    const viewPulse =
+      ORB_TWIST_VIEW_WAVE * branchE * m3d * Math.sin(2 * ang - bloomTwistRad * 1.88);
+    const helixA = ORB_HELIX_LATERAL * branchE * m3d * Math.sin(ang - bloomTwistRad * 1.28);
+    const helixB =
+      ORB_HELIX_LATERAL * branchE * m3d * 0.9 * Math.cos(ang * 1.62 + bloomTwistRad * 0.88);
+    const worldLift =
+      ORB_WORLD_LIFT * branchE * m3d * Math.sin(ang * 2.1 + bloomTwistRad * 1.05);
+
     bendAxisScratch.copy(dirScratch).cross(toCam);
     if (bendAxisScratch.lengthSq() < 1e-10) {
       bendAxisScratch.copy(ringE1);
@@ -763,9 +793,25 @@ function updateOrb(arr, dt, tShader, handBloomDrive) {
     }
     const sag = easeInOutSine(branchE) * 0.12;
 
-    const ox = dirScratch.x * L + toCam.x * depthPush + bendAxisScratch.x * sag;
-    const oy = dirScratch.y * L + toCam.y * depthPush + bendAxisScratch.y * sag;
-    const oz = dirScratch.z * L + toCam.z * depthPush + bendAxisScratch.z * sag;
+    const ox =
+      dirScratch.x * L +
+      toCam.x * (depthPush + viewPulse) +
+      bendAxisScratch.x * sag +
+      ringE0.x * helixA +
+      ringE1.x * helixB;
+    const oy =
+      dirScratch.y * L +
+      toCam.y * (depthPush + viewPulse) +
+      bendAxisScratch.y * sag +
+      ringE0.y * helixA +
+      ringE1.y * helixB +
+      worldLift;
+    const oz =
+      dirScratch.z * L +
+      toCam.z * (depthPush + viewPulse) +
+      bendAxisScratch.z * sag +
+      ringE0.z * helixA +
+      ringE1.z * helixB;
 
     lp[i6] = cx;
     lp[i6 + 1] = cy;
